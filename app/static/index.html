@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>文件管理器</title>
+  <title>File Manager</title>
   <style>
     :root { color-scheme: light dark; }
     body { font-family: -apple-system, BlinkMacSystemFont, Segoe UI, Roboto, Inter, "Helvetica Neue", Arial, "Noto Sans", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif; margin: 0; padding: 24px; }
@@ -19,6 +19,19 @@
     .muted { opacity: .75; }
     .row-actions button { margin-right: 6px; }
     .path { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; }
+    /* icon for items */
+    .icon { display: inline-flex; align-items: center; justify-content: center; width: 28px; height: 20px; margin-right: 8px; font-size: 14px; }
+    .icon.dir { color: #0b69ff; }
+    .icon.file { color: #666; }
+    .footer { margin-top: 28px; text-align: center; color: #666; font-size: 13px; opacity: 0.9; }
+  </style>
+  <style>
+    /* Upload list / progress */
+    #uploads { margin-top: 12px; display: flex; flex-direction: column; gap: 8px; }
+    .upload-item { display: flex; gap: 12px; align-items: center; }
+    .upload-item .meta { min-width: 200px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .upload-item progress { width: 320px; height: 14px; }
+    .upload-item .status { font-size: 12px; color: #666; min-width: 120px; }
   </style>
   <script>
     const api = {
@@ -53,7 +66,11 @@
       const tbody = document.querySelector('#list');
       tbody.innerHTML = '';
       if (state.path) addRow(tbody, { name: "..", isDir: true, size: 0, mtime: 0 }, true);
-      for (const it of data.items) addRow(tbody, it, false);
+      for (const it of data.items) {
+        // Defensive: skip hidden files/dirs starting with '.'
+        if (it.name && it.name.startsWith('.')) continue;
+        addRow(tbody, it, false);
+      }
     }
 
     function addRow(tbody, item, isUp) {
@@ -62,6 +79,11 @@
       nameTd.className = 'name';
       const a = document.createElement('span');
       a.textContent = item.name;
+      const icon = document.createElement('span');
+      icon.className = 'icon ' + (item.isDir ? 'dir' : 'file');
+      // Use emoji as fallback icon - simple and visible across platforms
+      icon.textContent = item.isDir ? '📁' : '📄';
+      nameTd.appendChild(icon);
       if (item.isDir) a.classList.add('dir');
       a.onclick = () => {
         if (item.isDir) {
@@ -110,9 +132,140 @@
     async function onUploadChanged(e) {
       const files = e.target.files;
       if (!files || files.length === 0) return;
-      await api.upload(state.path, files);
+      // Upload each file; use resumable upload for large files to avoid 413 from proxies
+      const MAX_SINGLE_UPLOAD = 50 * 1024 * 1024; // 50MB threshold for single request
+      for (const f of files) {
+        try {
+          if (f.size > MAX_SINGLE_UPLOAD) {
+            await uploadResumable(f);
+          } else {
+            // small file — use XHR with progress
+            const uploadEl = createUploadItem(f.name, f.size);
+            await uploadWithProgress(state.path, f, (loaded, total) => updateUploadProgress(uploadEl, loaded));
+            updateUploadProgress(uploadEl, f.size, true);
+          }
+        } catch (err) {
+          console.error('Upload failed for', f.name, err);
+          alert(`上传失败: ${f.name} — ${err}`);
+          break;
+        }
+      }
       e.target.value = '';
       refresh();
+    }
+
+    async function uploadResumable(file) {
+      // create/init upload session
+      const storageKey = `upload:${state.path}:${file.name}:${file.size}`;
+      let uploadId = localStorage.getItem(storageKey);
+      let offset = 0;
+      // If we have an uploadId already, query status to resume
+      if (uploadId) {
+        try {
+          const st = await fetch(`/api/upload/status?uploadId=${encodeURIComponent(uploadId)}`);
+          if (st.ok) {
+            const data = await st.json();
+            offset = data.received || 0;
+            console.log('Resuming upload', file.name, 'from', offset);
+          } else {
+            // unknown id on server; forget and re-init
+            uploadId = null;
+            localStorage.removeItem(storageKey);
+          }
+        } catch (e) {
+          // If status check fails, fall back to re-init
+          uploadId = null;
+          localStorage.removeItem(storageKey);
+        }
+      }
+      // create/init upload session if needed
+      if (!uploadId) {
+        const initRes = await fetch('/api/upload/init', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ path: state.path, filename: file.name, totalSize: file.size })
+        });
+        if (!initRes.ok) throw new Error('初始化上传失败');
+        const initData = await initRes.json();
+        uploadId = initData.uploadId;
+        localStorage.setItem(storageKey, uploadId);
+      }
+      const chunkSize = 5 * 1024 * 1024; // 5MB
+      let attempt = 0;
+      const uploadEl = createUploadItem(file.name, file.size);
+      while (offset < file.size) {
+        const end = Math.min(offset + chunkSize, file.size);
+        const blob = file.slice(offset, end);
+        const fd = new FormData();
+        fd.append('uploadId', uploadId);
+        fd.append('offset', String(offset));
+        fd.append('chunk', blob, file.name);
+        // simple retry on transient errors
+        let ok = false;
+        for (attempt = 0; attempt < 3 && !ok; attempt++) {
+          const res = await fetch('/api/upload/chunk', { method: 'POST', body: fd });
+          if (res.ok) {
+            const data = await res.json();
+            offset = data.received || end;
+            ok = true;
+            console.log(`Uploaded chunk, new offset=${offset}`);
+            updateUploadProgress(uploadEl, offset);
+          } else {
+            // small backoff
+            await new Promise(r => setTimeout(r, 500 * (attempt + 1)));
+          }
+        }
+        if (!ok) throw new Error('上传分片失败');
+      }
+      // finalize
+      const comp = await fetch('/api/upload/complete', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ uploadId }) });
+      if (!comp.ok) {
+        const txt = await comp.text();
+        throw new Error('完成合并失败: ' + txt);
+      }
+      // cleanup local storage
+      localStorage.removeItem(storageKey);
+      updateUploadProgress(uploadEl, file.size, true);
+      console.log('Upload complete for', file.name);
+      return true;
+    }
+
+    // Single-file upload with progress (for smaller files)
+    function uploadWithProgress(path, file, onProgress) {
+      return new Promise((resolve, reject) => {
+        const xhr = new XMLHttpRequest();
+        xhr.open('POST', `/api/upload?path=${encodeURIComponent(path)}`);
+        xhr.onload = () => {
+          if (xhr.status >= 200 && xhr.status < 300) {
+            resolve(JSON.parse(xhr.responseText));
+          } else {
+            reject(new Error(`上传失败: ${xhr.status} ${xhr.statusText}`));
+          }
+        };
+        xhr.onerror = () => reject(new Error('网络错误'));
+        xhr.upload.onprogress = (ev) => {
+          if (ev.lengthComputable) onProgress(ev.loaded, ev.total);
+        };
+        const fd = new FormData(); fd.append('files', file);
+        xhr.send(fd);
+      });
+    }
+
+    function createUploadItem(name, total) {
+      const uploads = document.querySelector('#uploads');
+      const wrap = document.createElement('div'); wrap.className = 'upload-item';
+      const meta = document.createElement('div'); meta.className = 'meta'; meta.textContent = name;
+      const prog = document.createElement('progress'); prog.max = total; prog.value = 0;
+      const status = document.createElement('div'); status.className = 'status'; status.textContent = '准备中';
+      wrap.append(meta, prog, status);
+      uploads.prepend(wrap);
+      return { wrap, prog, status };
+    }
+
+    function updateUploadProgress(el, loaded, done=false) {
+      try {
+        el.prog.value = loaded;
+        el.status.textContent = done ? '完成' : `${Math.round((loaded/el.prog.max)*100)}% (${loaded}/${el.prog.max} bytes)`;
+      } catch(e) { console.debug(e); }
     }
 
     async function onMkdir() {
@@ -126,6 +279,8 @@
 
     window.addEventListener('DOMContentLoaded', () => {
       document.querySelector('#upload').addEventListener('change', onUploadChanged);
+      const uploadBtn = document.querySelector('#uploadBtn');
+      if (uploadBtn) uploadBtn.addEventListener('click', () => document.querySelector('#upload').click());
       document.querySelector('#mkdir').addEventListener('click', onMkdir);
       document.querySelector('#root').addEventListener('click', onGoRoot);
       refresh();
@@ -134,23 +289,25 @@
 </head>
 <body>
   <header>
-    <h1>文件管理器</h1>
+    <h1>File Manager</h1>
   </header>
   <div class="bar">
     <button id="root">回到根目录</button>
     <button id="mkdir">新建目录</button>
     <label>
-      <span>上传文件</span>
+      <button id="uploadBtn" type="button">上传文件</button>
       <input id="upload" type="file" multiple style="display:none" />
     </label>
     <span class="path">当前路径：<span id="cwd">/</span></span>
   </div>
+  <div id="uploads" aria-live="polite"></div>
   <table>
     <thead>
       <tr><th>名称</th><th>大小</th><th>修改时间</th><th>操作</th></tr>
     </thead>
     <tbody id="list"></tbody>
   </table>
+  <footer class="footer">© 2025 成都破晓石科技有限公司 版权所有。</footer>
 </body>
 </html>
 

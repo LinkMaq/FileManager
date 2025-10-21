@@ -1,0 +1,54 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: virtisos-pvc
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 100Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: virtisos
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: virtisos
+  template:
+    metadata:
+      labels:
+        app: virtisos
+    spec:
+      containers:
+        - name: virtisos
+          image: registry.cn-hangzhou.aliyuncs.com/xiaoshiai/virtisos:latest
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: FILE_MANAGER_DEFAULT_ROOT
+              value: /data
+          ports:
+            - containerPort: 8000
+          volumeMounts:
+            - name: data
+              mountPath: /data
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: virtisos-pvc
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: virtisos
+spec:
+  type: ClusterIP
+  selector:
+    app: virtisos
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8000

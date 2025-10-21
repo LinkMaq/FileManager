@@ -16,10 +16,10 @@ python -m app.main
 ## Docker 构建与运行
 
 ```bash
-docker build -t file-manager:latest .
+docker build -t virtisos:latest .
 # 挂载宿主目录到容器 /data
 mkdir -p ./data
-docker run --rm -it -p 8000:8000 -v $(pwd)/data:/data file-manager:latest
+docker run --rm -it -p 8000:8000 -v $(pwd)/data:/data virtisos:latest
 ```
 
 ## 生成 Kubernetes YAML

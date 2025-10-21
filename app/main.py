@@ -2,8 +2,10 @@ import os
 from pathlib import Path
 from typing import List, Optional
 
-from fastapi import FastAPI, File, UploadFile, HTTPException, Query
+from fastapi import FastAPI, File, UploadFile, HTTPException, Query, Form
 from fastapi import Body
+import uuid
+import json
 from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -19,6 +21,11 @@ def get_root_dir() -> Path:
 
 ROOT_DIR: Path = get_root_dir()
 ROOT_DIR.mkdir(parents=True, exist_ok=True)
+UPLOADS_DIR = ROOT_DIR / ".uploads"
+UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
+
+# Maximum supported upload size (20 GiB)
+MAX_UPLOAD_BYTES = 20 * 1024 ** 3
 
 
 def resolve_safe_path(relative_path: str) -> Path:
@@ -37,6 +44,9 @@ def list_dir(target: Path):
         raise HTTPException(status_code=400, detail="Path is not a directory")
     items = []
     for entry in sorted(target.iterdir(), key=lambda p: (not p.is_dir(), p.name.lower())):
+        # Skip hidden files and directories (those starting with a dot)
+        if entry.name.startswith('.'):
+            continue
         stat = entry.stat()
         items.append({
             "name": entry.name,
@@ -89,8 +99,138 @@ async def api_upload(
         dest = resolve_safe_path(str(Path(path or "") / upload.filename))
         if dest.exists() and dest.is_dir():
             raise HTTPException(status_code=400, detail=f"A directory named {upload.filename} already exists")
-        with dest.open("wb") as f:
-            f.write(await upload.read())
+        # Stream the upload to disk in chunks to support very large files without high memory usage.
+        tmp_dest = dest.with_name(dest.name + ".part")
+        try:
+            # Ensure parent exists
+            tmp_dest.parent.mkdir(parents=True, exist_ok=True)
+            with tmp_dest.open("wb") as f:
+                chunk_size = 1024 * 1024  # 1MB
+                while True:
+                    chunk = await upload.read(chunk_size)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+            # Atomic rename to final destination
+            tmp_dest.replace(dest)
+        except Exception:
+            # Clean up partial file on error
+            try:
+                if tmp_dest.exists():
+                    tmp_dest.unlink()
+            except Exception:
+                pass
+            raise
+    return {"ok": True}
+
+
+@app.post("/api/upload/init")
+def api_upload_init(body: dict = Body(...)):
+    # Initialize a resumable upload. Client may provide uploadId or leave blank.
+    path = body.get("path", "")
+    filename = body.get("filename")
+    total_size = int(body.get("totalSize", 0))
+    upload_id = body.get("uploadId") or str(uuid.uuid4())
+    if not filename:
+        raise HTTPException(status_code=400, detail="Missing filename")
+    if total_size <= 0:
+        raise HTTPException(status_code=400, detail="Invalid totalSize")
+    if total_size > MAX_UPLOAD_BYTES:
+        raise HTTPException(status_code=400, detail=f"Max upload size is {MAX_UPLOAD_BYTES} bytes")
+    # validate parent exists
+    parent = resolve_safe_path(path or "")
+    if not parent.exists() or not parent.is_dir():
+        raise HTTPException(status_code=400, detail="Parent directory invalid")
+    meta = {
+        "uploadId": upload_id,
+        "path": path,
+        "filename": filename,
+        "totalSize": total_size,
+    }
+    meta_path = UPLOADS_DIR / (upload_id + ".json")
+    with meta_path.open("w", encoding="utf-8") as mf:
+        json.dump(meta, mf)
+    part_path = UPLOADS_DIR / (upload_id + ".part")
+    # ensure empty file exists
+    if not part_path.exists():
+        part_path.parent.mkdir(parents=True, exist_ok=True)
+        with part_path.open("wb"):
+            pass
+    return {"uploadId": upload_id}
+
+
+@app.post("/api/upload/chunk")
+async def api_upload_chunk(
+    uploadId: str = Form(...),
+    offset: int = Form(...),
+    chunk: UploadFile = File(...),
+):
+    meta_path = UPLOADS_DIR / (uploadId + ".json")
+    if not meta_path.exists():
+        raise HTTPException(status_code=404, detail="uploadId not found")
+    with meta_path.open("r", encoding="utf-8") as mf:
+        meta = json.load(mf)
+    part_path = UPLOADS_DIR / (uploadId + ".part")
+    # write chunk at offset
+    try:
+        # open/create in r+b mode
+        part_path.parent.mkdir(parents=True, exist_ok=True)
+        mode = "r+b" if part_path.exists() else "w+b"
+        with part_path.open(mode) as f:
+            f.seek(offset)
+            # stream read and write
+            read_size = 0
+            while True:
+                data = await chunk.read(1024 * 1024)
+                if not data:
+                    break
+                f.write(data)
+                read_size += len(data)
+            f.flush()
+            os.fsync(f.fileno())
+            current_size = f.tell()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to write chunk: {e}")
+    return {"ok": True, "received": current_size}
+
+
+@app.get("/api/upload/status")
+def api_upload_status(uploadId: str = Query(...)):
+    meta_path = UPLOADS_DIR / (uploadId + ".json")
+    if not meta_path.exists():
+        raise HTTPException(status_code=404, detail="uploadId not found")
+    with meta_path.open("r", encoding="utf-8") as mf:
+        meta = json.load(mf)
+    part_path = UPLOADS_DIR / (uploadId + ".part")
+    received = part_path.stat().st_size if part_path.exists() else 0
+    return {"uploadId": uploadId, "received": received, "totalSize": meta.get("totalSize")}
+
+
+@app.post("/api/upload/complete")
+def api_upload_complete(body: dict = Body(...)):
+    upload_id = body.get("uploadId")
+    if not upload_id:
+        raise HTTPException(status_code=400, detail="Missing uploadId")
+    meta_path = UPLOADS_DIR / (upload_id + ".json")
+    if not meta_path.exists():
+        raise HTTPException(status_code=404, detail="uploadId not found")
+    with meta_path.open("r", encoding="utf-8") as mf:
+        meta = json.load(mf)
+    part_path = UPLOADS_DIR / (upload_id + ".part")
+    if not part_path.exists():
+        raise HTTPException(status_code=404, detail="part file not found")
+    received = part_path.stat().st_size
+    total = int(meta.get("totalSize", 0))
+    if received != total:
+        raise HTTPException(status_code=400, detail=f"Incomplete upload: received {received} of {total}")
+    # move to final destination
+    dest = resolve_safe_path(str(Path(meta.get("path", "")) / meta.get("filename")))
+    try:
+        part_path.replace(dest)
+        # remove meta
+        meta_path.unlink()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to finalize upload: {e}")
     return {"ok": True}
 
 
