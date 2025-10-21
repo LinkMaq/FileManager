@@ -1,0 +1,157 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>文件管理器</title>
+  <style>
+    :root { color-scheme: light dark; }
+    body { font-family: -apple-system, BlinkMacSystemFont, Segoe UI, Roboto, Inter, "Helvetica Neue", Arial, "Noto Sans", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif; margin: 0; padding: 24px; }
+    header { display: flex; align-items: center; gap: 12px; margin-bottom: 16px; }
+    h1 { font-size: 20px; margin: 0; }
+    .bar { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 12px; }
+    input, button { font-size: 14px; padding: 6px 10px; }
+    table { width: 100%; border-collapse: collapse; }
+    th, td { text-align: left; border-bottom: 1px solid #ddd3; padding: 8px; }
+    tr:hover { background: #eee2; }
+    .name { cursor: pointer; }
+    .dir { font-weight: 600; }
+    .muted { opacity: .75; }
+    .row-actions button { margin-right: 6px; }
+    .path { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; }
+  </style>
+  <script>
+    const api = {
+      list: async (path = "") => (await fetch(`/api/list?path=${encodeURIComponent(path)}`)).json(),
+      download: (path) => { window.location.href = `/api/download?path=${encodeURIComponent(path)}`; },
+      upload: async (path, files) => {
+        const fd = new FormData();
+        for (const f of files) fd.append('files', f);
+        const res = await fetch(`/api/upload?path=${encodeURIComponent(path)}`, { method: 'POST', body: fd });
+        if (!res.ok) throw new Error('上传失败');
+      },
+      mkdir: async (path, name) => {
+        const res = await fetch('/api/mkdir', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ path, name }) });
+        if (!res.ok) throw new Error('创建目录失败');
+      },
+      rename: async (path, oldName, newName) => {
+        const res = await fetch('/api/rename', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ path, oldName, newName }) });
+        if (!res.ok) throw new Error('重命名失败');
+      },
+      del: async (path, name) => {
+        const res = await fetch('/api/delete', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ path, name }) });
+        if (!res.ok) throw new Error('删除失败（目录需为空）');
+      }
+    };
+
+    let state = { path: "" };
+
+    async function refresh() {
+      const data = await api.list(state.path);
+      state.path = data.cwd || "";
+      document.querySelector('#cwd').textContent = state.path || "/";
+      const tbody = document.querySelector('#list');
+      tbody.innerHTML = '';
+      if (state.path) addRow(tbody, { name: "..", isDir: true, size: 0, mtime: 0 }, true);
+      for (const it of data.items) addRow(tbody, it, false);
+    }
+
+    function addRow(tbody, item, isUp) {
+      const tr = document.createElement('tr');
+      const nameTd = document.createElement('td');
+      nameTd.className = 'name';
+      const a = document.createElement('span');
+      a.textContent = item.name;
+      if (item.isDir) a.classList.add('dir');
+      a.onclick = () => {
+        if (item.isDir) {
+          if (isUp) {
+            const parts = (state.path || '').split('/').filter(Boolean); parts.pop();
+            state.path = parts.join('/');
+          } else {
+            state.path = [state.path, item.name].filter(Boolean).join('/');
+          }
+          refresh();
+        } else {
+          api.download([state.path, item.name].filter(Boolean).join('/'));
+        }
+      };
+      nameTd.appendChild(a);
+      const sizeTd = document.createElement('td');
+      sizeTd.textContent = item.isDir ? '-' : humanSize(item.size);
+      const mtimeTd = document.createElement('td');
+      mtimeTd.className = 'muted';
+      mtimeTd.textContent = item.mtime ? new Date(item.mtime * 1000).toLocaleString() : '';
+      const actTd = document.createElement('td');
+      actTd.className = 'row-actions';
+      if (!isUp) {
+        const renameBtn = document.createElement('button');
+        renameBtn.textContent = '重命名';
+        renameBtn.onclick = async () => {
+          const newName = prompt('输入新名称', item.name);
+          if (!newName || newName === item.name) return;
+          await api.rename(state.path, item.name, newName); await refresh();
+        };
+        const delBtn = document.createElement('button');
+        delBtn.textContent = '删除';
+        delBtn.onclick = async () => { if (confirm('确定删除？')) { await api.del(state.path, item.name); await refresh(); } };
+        actTd.append(renameBtn, delBtn);
+      }
+      tr.append(nameTd, sizeTd, mtimeTd, actTd);
+      tbody.appendChild(tr);
+    }
+
+    function humanSize(n) {
+      const u = ['B','KB','MB','GB','TB'];
+      let i = 0; while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; }
+      return `${n.toFixed(1)} ${u[i]}`;
+    }
+
+    async function onUploadChanged(e) {
+      const files = e.target.files;
+      if (!files || files.length === 0) return;
+      await api.upload(state.path, files);
+      e.target.value = '';
+      refresh();
+    }
+
+    async function onMkdir() {
+      const name = prompt('输入目录名');
+      if (!name) return;
+      await api.mkdir(state.path, name);
+      refresh();
+    }
+
+    async function onGoRoot() { state.path = ""; refresh(); }
+
+    window.addEventListener('DOMContentLoaded', () => {
+      document.querySelector('#upload').addEventListener('change', onUploadChanged);
+      document.querySelector('#mkdir').addEventListener('click', onMkdir);
+      document.querySelector('#root').addEventListener('click', onGoRoot);
+      refresh();
+    });
+  </script>
+</head>
+<body>
+  <header>
+    <h1>文件管理器</h1>
+  </header>
+  <div class="bar">
+    <button id="root">回到根目录</button>
+    <button id="mkdir">新建目录</button>
+    <label>
+      <span>上传文件</span>
+      <input id="upload" type="file" multiple style="display:none" />
+    </label>
+    <span class="path">当前路径：<span id="cwd">/</span></span>
+  </div>
+  <table>
+    <thead>
+      <tr><th>名称</th><th>大小</th><th>修改时间</th><th>操作</th></tr>
+    </thead>
+    <tbody id="list"></tbody>
+  </table>
+</body>
+</html>
+
+
