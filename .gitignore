@@ -1,1 +1,11 @@
 data/
+__pycache__/
+*.pyc
+.env
+.vscode/
+.DS_Store
+.idea/
+node_modules/
+dist/
+build/
+*.log
