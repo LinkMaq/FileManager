@@ -6,7 +6,8 @@ from fastapi import FastAPI, File, UploadFile, HTTPException, Query, Form
 from fastapi import Body
 import uuid
 import json
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, RedirectResponse
+from urllib.parse import quote
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
@@ -79,10 +80,27 @@ def api_list(path: Optional[str] = Query(default="")):
 
 @app.get("/api/download")
 def api_download(path: str = Query(...)):
-    target = resolve_safe_path(path)
+    # Validate the requested path first
+    _ = resolve_safe_path(path)
+    # Redirect to a filename-based URL (so clients like wget will use the last URL segment
+    # as the default filename). Keep slashes in the path when quoting so nested paths work.
+    safe_rel = (path or "").lstrip("/")
+    redirect_url = "/api/download/raw/" + quote(safe_rel, safe='/')
+    return RedirectResponse(redirect_url)
+
+
+@app.get("/api/download/raw/{file_path:path}")
+def api_download_raw(file_path: str):
+    target = resolve_safe_path(file_path)
     if not target.exists() or not target.is_file():
         raise HTTPException(status_code=404, detail="File not found")
-    return FileResponse(str(target), filename=target.name)
+    # Provide Content-Disposition (including RFC5987 filename*) as a fallback for clients
+    # that respect it.
+    filename = target.name
+    filename_star = quote(filename, safe='')
+    content_disposition = f"attachment; filename=\"{filename}\"; filename*=UTF-8''{filename_star}"
+    headers = {"Content-Disposition": content_disposition}
+    return FileResponse(str(target), headers=headers, media_type="application/octet-stream")
 
 
 @app.post("/api/upload")
@@ -287,6 +305,13 @@ def api_delete(body: dict = Body(...)):
 
 # Serve static frontend
 static_dir = Path(__file__).parent / "static"
+# Also expose a direct /iso route mapped to the server's iso directory so clients
+# can download ISO files with clean filenames using URLs like
+#   http://<host>/iso/Win11_25H2_Chinese_Simplified_x64.iso
+iso_dir = ROOT_DIR / "iso"
+iso_dir.mkdir(parents=True, exist_ok=True)
+app.mount("/iso", StaticFiles(directory=str(iso_dir)), name="iso")
+
 app.mount("/", StaticFiles(directory=str(static_dir), html=True), name="static")
 
 
